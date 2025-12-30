@@ -1,125 +1,372 @@
+import os
+import json
 import logging
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-import g4f
+from datetime import datetime
+from pathlib import Path
+from dotenv import load_dotenv
+import telebot
+from telebot.types import Message
+import openai
 
-# Enable logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+# Load environment variables
+load_dotenv()
+TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+
+# Configure OpenAI
+openai.api_key = OPENAI_API_KEY
+
+# Initialize bot
+bot = telebot.TeleBot(TOKEN)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Replace with your Telegram bot token
-TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN_HERE"
+# Conversation history directory
+HISTORY_DIR = Path('conversation_history')
+HISTORY_DIR.mkdir(exist_ok=True)
+
+# User language preferences
+user_languages = {}
+
+# Russian language strings
+RUSSIAN_STRINGS = {
+    'start': '🤖 Привет! Я ChatGPT бот. Вот доступные команды:',
+    'help': '📖 Справка по командам:',
+    'commands': {
+        '/start': 'Начать работу с ботом',
+        '/help': 'Показать справку',
+        '/russian': 'Переключиться на русский язык',
+        '/english': 'Переключиться на английский язык',
+        '/clear': 'Очистить историю диалога',
+        '/history': 'Показать историю диалога',
+        '/status': 'Показать статус бота',
+    },
+    'welcome': 'Добро пожаловать! Вы можете отправлять текстовые сообщения или файлы для анализа.',
+    'language_set': 'Язык установлен на русский 🇷🇺',
+    'english_set': 'Language set to English 🇬🇧',
+    'history_cleared': 'История диалога очищена ✓',
+    'no_history': 'История диалога пуста',
+    'status': 'Статус бота: ✅ Онлайн',
+    'processing': '⏳ Обработка вашего запроса...',
+    'error': '❌ Произошла ошибка: {}',
+    'file_received': '📄 Файл получен: {}',
+    'file_analyzed': '✓ Файл проанализирован',
+    'file_error': '❌ Ошибка при обработке файла: {}',
+    'send_message': 'Отправьте сообщение для получения ответа от ChatGPT',
+}
+
+ENGLISH_STRINGS = {
+    'start': '🤖 Hello! I am a ChatGPT bot. Here are the available commands:',
+    'help': '📖 Command help:',
+    'commands': {
+        '/start': 'Start using the bot',
+        '/help': 'Show help',
+        '/russian': 'Switch to Russian language',
+        '/english': 'Switch to English language',
+        '/clear': 'Clear conversation history',
+        '/history': 'Show conversation history',
+        '/status': 'Show bot status',
+    },
+    'welcome': 'Welcome! You can send text messages or files for analysis.',
+    'language_set': 'Language set to Russian 🇷🇺',
+    'english_set': 'Language set to English 🇬🇧',
+    'history_cleared': 'Conversation history cleared ✓',
+    'no_history': 'Conversation history is empty',
+    'status': 'Bot status: ✅ Online',
+    'processing': '⏳ Processing your request...',
+    'error': '❌ An error occurred: {}',
+    'file_received': '📄 File received: {}',
+    'file_analyzed': '✓ File analyzed',
+    'file_error': '❌ Error processing file: {}',
+    'send_message': 'Send a message to get a response from ChatGPT',
+}
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a message when the command /start is issued."""
-    user = update.effective_user
-    await update.message.reply_html(
-        rf"Hi {user.mention_html()}! 👋\n\n"
-        "I'm a ChatGPT bot powered by g4f. Send me any message and I'll respond using free ChatGPT API.\n\n"
-        "Commands:\n"
-        "/start - Show this welcome message\n"
-        "/help - Show help information\n"
-        "/clear - Clear conversation history"
-    )
+def get_user_language(user_id):
+    """Get user's language preference (default: English)"""
+    return user_languages.get(user_id, 'english')
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a message when the command /help is issued."""
-    help_text = (
-        "🤖 ChatGPT Telegram Bot\n\n"
-        "This bot uses g4f library to provide free access to ChatGPT.\n\n"
-        "How to use:\n"
-        "1. Just send any message and I'll respond with ChatGPT's reply\n"
-        "2. Use /clear to reset our conversation\n"
-        "3. Use /start to see the welcome message\n\n"
-        "⚠️ Note: Responses may take a moment to generate."
-    )
-    await update.message.reply_text(help_text)
+def get_string(user_id, key):
+    """Get localized string for user"""
+    language = get_user_language(user_id)
+    strings = RUSSIAN_STRINGS if language == 'russian' else ENGLISH_STRINGS
+    return strings.get(key, key)
 
 
-async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Clear the conversation history for the user."""
-    context.user_data.clear()
-    await update.message.reply_text("✅ Conversation history cleared!")
+def get_history_file(user_id):
+    """Get the path to user's conversation history file"""
+    return HISTORY_DIR / f'user_{user_id}_history.json'
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle incoming messages and generate responses using g4f."""
-    user_message = update.message.text
-    user_id = update.effective_user.id
+def load_conversation_history(user_id):
+    """Load conversation history from JSON file"""
+    history_file = get_history_file(user_id)
+    if history_file.exists():
+        try:
+            with open(history_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            logger.error(f'Error loading history for user {user_id}: {e}')
+            return []
+    return []
+
+
+def save_conversation_history(user_id, history):
+    """Save conversation history to JSON file"""
+    history_file = get_history_file(user_id)
+    try:
+        with open(history_file, 'w', encoding='utf-8') as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+    except IOError as e:
+        logger.error(f'Error saving history for user {user_id}: {e}')
+
+
+def add_to_history(user_id, role, content):
+    """Add message to conversation history"""
+    history = load_conversation_history(user_id)
+    history.append({
+        'role': role,
+        'content': content,
+        'timestamp': datetime.utcnow().isoformat()
+    })
+    save_conversation_history(user_id, history)
+    return history
+
+
+def get_gpt_response(user_id, user_message):
+    """Get response from ChatGPT API"""
+    try:
+        # Load conversation history
+        history = load_conversation_history(user_id)
+        
+        # Build messages for API
+        messages = [
+            {'role': msg['role'], 'content': msg['content']}
+            for msg in history
+        ]
+        
+        # Add current user message
+        messages.append({'role': 'user', 'content': user_message})
+        
+        # Call OpenAI API
+        response = openai.ChatCompletion.create(
+            model='gpt-3.5-turbo',
+            messages=messages,
+            max_tokens=2000,
+            temperature=0.7,
+        )
+        
+        assistant_message = response['choices'][0]['message']['content']
+        
+        # Save both messages to history
+        add_to_history(user_id, 'user', user_message)
+        add_to_history(user_id, 'assistant', assistant_message)
+        
+        return assistant_message
+    except Exception as e:
+        logger.error(f'Error getting ChatGPT response: {e}')
+        return None
+
+
+def extract_text_from_file(file_path):
+    """Extract text from uploaded file"""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return f.read()
+    except UnicodeDecodeError:
+        try:
+            with open(file_path, 'r', encoding='latin-1') as f:
+                return f.read()
+        except Exception as e:
+            logger.error(f'Error reading file: {e}')
+            return None
+    except Exception as e:
+        logger.error(f'Error extracting text: {e}')
+        return None
+
+
+@bot.message_handler(commands=['start'])
+def handle_start(message: Message):
+    """Handle /start command"""
+    user_id = message.from_user.id
+    user_languages[user_id] = 'english'  # Default to English
     
-    # Show typing indicator
-    await update.message.chat.send_action("typing")
+    help_text = get_string(user_id, 'start') + '\n\n'
+    commands = get_string(user_id, 'commands')
+    for cmd, desc in commands.items():
+        help_text += f'{cmd} - {desc}\n'
+    
+    help_text += f'\n{get_string(user_id, "welcome")}'
+    bot.reply_to(message, help_text)
+    logger.info(f'User {user_id} started the bot')
+
+
+@bot.message_handler(commands=['help'])
+def handle_help(message: Message):
+    """Handle /help command"""
+    user_id = message.from_user.id
+    
+    help_text = get_string(user_id, 'help') + '\n\n'
+    commands = get_string(user_id, 'commands')
+    for cmd, desc in commands.items():
+        help_text += f'{cmd} - {desc}\n'
+    
+    bot.reply_to(message, help_text)
+
+
+@bot.message_handler(commands=['russian'])
+def handle_russian(message: Message):
+    """Switch to Russian language"""
+    user_id = message.from_user.id
+    user_languages[user_id] = 'russian'
+    bot.reply_to(message, '🇷🇺 Язык установлен на русский')
+    logger.info(f'User {user_id} switched to Russian')
+
+
+@bot.message_handler(commands=['english'])
+def handle_english(message: Message):
+    """Switch to English language"""
+    user_id = message.from_user.id
+    user_languages[user_id] = 'english'
+    bot.reply_to(message, '🇬🇧 Language set to English')
+    logger.info(f'User {user_id} switched to English')
+
+
+@bot.message_handler(commands=['clear'])
+def handle_clear(message: Message):
+    """Clear conversation history"""
+    user_id = message.from_user.id
+    history_file = get_history_file(user_id)
+    
+    if history_file.exists():
+        try:
+            history_file.unlink()
+            bot.reply_to(message, get_string(user_id, 'history_cleared'))
+            logger.info(f'User {user_id} cleared conversation history')
+        except Exception as e:
+            bot.reply_to(message, get_string(user_id, 'error').format(str(e)))
+    else:
+        bot.reply_to(message, get_string(user_id, 'no_history'))
+
+
+@bot.message_handler(commands=['history'])
+def handle_history(message: Message):
+    """Show conversation history"""
+    user_id = message.from_user.id
+    history = load_conversation_history(user_id)
+    
+    if not history:
+        bot.reply_to(message, get_string(user_id, 'no_history'))
+        return
+    
+    history_text = '📜 История диалога:\n\n' if get_user_language(user_id) == 'russian' else '📜 Conversation History:\n\n'
+    
+    for i, msg in enumerate(history[-10:], 1):  # Show last 10 messages
+        role = 'You' if msg['role'] == 'user' else 'Bot'
+        timestamp = msg.get('timestamp', 'N/A')
+        history_text += f'{i}. [{role}] {timestamp}\n{msg["content"][:100]}...\n\n'
+    
+    if len(history_text) > 4096:
+        # Split message if too long
+        bot.reply_to(message, history_text[:4096])
+        bot.send_message(user_id, history_text[4096:])
+    else:
+        bot.reply_to(message, history_text)
+
+
+@bot.message_handler(commands=['status'])
+def handle_status(message: Message):
+    """Show bot status"""
+    user_id = message.from_user.id
+    bot.reply_to(message, get_string(user_id, 'status'))
+
+
+@bot.message_handler(content_types=['document'])
+def handle_document(message: Message):
+    """Handle document uploads"""
+    user_id = message.from_user.id
     
     try:
-        # Get conversation history from user data
-        if "history" not in context.user_data:
-            context.user_data["history"] = []
+        # Get file info
+        file_info = bot.get_file(message.document.file_id)
+        file_name = message.document.file_name
         
-        history = context.user_data["history"]
+        # Download file
+        downloaded_file = bot.download_file(file_info.file_path)
         
-        # Add user message to history
-        history.append({
-            "role": "user",
-            "content": user_message
-        })
+        # Save temporarily
+        temp_file_path = f'temp_{user_id}_{file_name}'
+        with open(temp_file_path, 'wb') as f:
+            f.write(downloaded_file)
         
-        # Generate response using g4f
-        logger.info(f"Generating response for user {user_id}")
+        bot.reply_to(message, get_string(user_id, 'file_received').format(file_name))
         
-        response = await g4f.ChatCompletion.create_async(
-            model=g4f.models.default,
-            messages=history,
-            timeout=60,
-        )
+        # Extract text
+        file_content = extract_text_from_file(temp_file_path)
         
-        bot_response = str(response).strip()
-        
-        # Add bot response to history
-        history.append({
-            "role": "assistant",
-            "content": bot_response
-        })
-        
-        # Keep only last 10 messages in history to avoid memory issues
-        if len(history) > 20:
-            context.user_data["history"] = history[-20:]
-        
-        # Send response in chunks if it's too long (Telegram has a 4096 character limit)
-        if len(bot_response) > 4096:
-            for i in range(0, len(bot_response), 4096):
-                await update.message.reply_text(bot_response[i:i+4096])
+        if file_content:
+            # Create analysis prompt
+            analysis_prompt = f'Analyze the following text from file "{file_name}":\n\n{file_content[:2000]}'
+            
+            # Get ChatGPT response
+            bot.send_message(user_id, get_string(user_id, 'processing'))
+            response = get_gpt_response(user_id, analysis_prompt)
+            
+            if response:
+                bot.send_message(user_id, response)
+                bot.send_message(user_id, get_string(user_id, 'file_analyzed'))
+                logger.info(f'User {user_id} uploaded and analyzed file: {file_name}')
+            else:
+                bot.send_message(user_id, get_string(user_id, 'error').format('Failed to get response'))
         else:
-            await update.message.reply_text(bot_response)
+            bot.send_message(user_id, get_string(user_id, 'file_error').format('Unable to read file'))
+        
+        # Clean up temp file
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
             
     except Exception as e:
-        logger.error(f"Error generating response: {str(e)}")
-        await update.message.reply_text(
-            "❌ Sorry, I encountered an error while processing your request. "
-            "Please try again later or use /clear to reset the conversation."
-        )
+        logger.error(f'Error handling document: {e}')
+        bot.reply_to(message, get_string(user_id, 'file_error').format(str(e)))
 
 
-def main() -> None:
-    """Start the bot."""
-    # Create the Application
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+@bot.message_handler(func=lambda message: True)
+def handle_message(message: Message):
+    """Handle regular text messages"""
+    user_id = message.from_user.id
+    user_text = message.text
     
-    # on different commands - answer in Telegram
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("clear", clear_command))
+    # Show processing indicator
+    processing_msg = bot.send_message(user_id, get_string(user_id, 'processing'))
     
-    # on non command i.e message - echo the message on Telegram
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    # Run the bot
-    logger.info("Starting Telegram ChatGPT Bot...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        # Get response from ChatGPT
+        response = get_gpt_response(user_id, user_text)
+        
+        if response:
+            # Delete processing message
+            bot.delete_message(user_id, processing_msg.message_id)
+            # Send response
+            bot.reply_to(message, response)
+            logger.info(f'User {user_id} sent message and received response')
+        else:
+            bot.send_message(user_id, get_string(user_id, 'error').format('Failed to get response'))
+    except Exception as e:
+        logger.error(f'Error handling message: {e}')
+        bot.send_message(user_id, get_string(user_id, 'error').format(str(e)))
+
+
+def main():
+    """Main bot loop"""
+    logger.info('Bot started successfully')
+    try:
+        bot.infinity_polling()
+    except Exception as e:
+        logger.error(f'Bot error: {e}')
+        main()  # Restart on error
 
 
 if __name__ == '__main__':
