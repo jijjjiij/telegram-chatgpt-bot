@@ -1,424 +1,418 @@
-#!/usr/bin/env python3
 """
-Telegram ChatGPT Bot with g4f Integration
+Telegram ChatGPT Bot using aiogram framework with Russian language support
 Features:
-- g4f library integration instead of OpenAI API
+- aiogram 3.x framework
 - Russian language support
+- g4f integration for free ChatGPT access
 - Conversation history persistence
-- File handling capabilities
+- File handling (images, documents)
 """
 
 import logging
 import json
 import os
-from pathlib import Path
-from datetime import datetime
-from typing import Dict, List, Optional
 import asyncio
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, Dict, List
+import aiofiles
 
-from telegram import Update, Document
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-    ConversationHandler,
-)
-from telegram.constants import ChatAction
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import Message, File, Document
+from aiogram.utils.markdown import hbold, hcode
 
 try:
     import g4f
 except ImportError:
-    print("Please install g4f: pip install g4f")
-    exit(1)
+    g4f = None
 
-# Configure logging
+# Configuration
+TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
+HISTORY_DIR = Path('conversation_history')
+UPLOADS_DIR = Path('uploads')
+MAX_HISTORY_MESSAGES = 20
+LOG_LEVEL = logging.INFO
+
+# Create necessary directories
+HISTORY_DIR.mkdir(exist_ok=True)
+UPLOADS_DIR.mkdir(exist_ok=True)
+
+# Setup logging
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=LOG_LEVEL,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Configuration
-CONVERSATION_DIR = Path("conversations")
-MAX_HISTORY_LENGTH = 50
-SUPPORTED_FILE_TYPES = {'.txt', '.md', '.pdf', '.json', '.py', '.js', '.html', '.css'}
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-
-# Russian translations
-TRANSLATIONS = {
-    'en': {
-        'welcome': 'Welcome! I\'m a ChatGPT-powered bot using g4f. Send me any message and I\'ll respond.',
-        'help': (
-            'Available commands:\n'
-            '/start - Start the bot\n'
-            '/help - Show this message\n'
-            '/clear - Clear conversation history\n'
-            '/history - Show conversation history\n'
-            '/language - Switch language (en/ru)\n'
-            '/file - Send a file for analysis\n\n'
-            'Just send me any message to chat!'
-        ),
-        'cleared': '✓ Conversation history cleared.',
-        'history_empty': 'No conversation history yet.',
-        'typing': 'Typing...',
-        'error': 'Sorry, an error occurred. Please try again.',
-        'language_switched': 'Language switched to English.',
-        'file_received': 'File received: {}. Processing...',
-        'file_error': 'Error processing file: {}',
-        'unsupported_file': 'Unsupported file type. Supported: {}',
-        'no_file': 'Please attach a file to analyze.',
-    },
-    'ru': {
-        'welcome': 'Добро пожаловать! Я чат-бот на основе ChatGPT с использованием g4f. Отправьте мне любое сообщение, и я отвечу.',
-        'help': (
-            'Доступные команды:\n'
-            '/start - Запустить бота\n'
-            '/help - Показать эту справку\n'
-            '/clear - Очистить историю разговора\n'
-            '/history - Показать историю разговора\n'
-            '/language - Переключить язык (en/ru)\n'
-            '/file - Отправить файл для анализа\n\n'
-            'Просто отправьте мне любое сообщение для общения!'
-        ),
-        'cleared': '✓ История разговора очищена.',
-        'history_empty': 'История разговора пуста.',
-        'typing': 'Печатаю...',
-        'error': 'Извините, произошла ошибка. Пожалуйста, попробуйте ��нова.',
-        'language_switched': 'Язык переключен на русский.',
-        'file_received': 'Файл получен: {}. Обработка...',
-        'file_error': 'Ошибка при обработке файла: {}',
-        'unsupported_file': 'Неподдерживаемый тип файла. Поддерживаемые: {}',
-        'no_file': 'Пожалуйста, приложите файл для анализа.',
-    }
+# Russian language strings
+TEXTS = {
+    'welcome': '👋 Добро пожаловать в ChatGPT бот!\n\nДоступные команды:\n/start - Начать\n/clear - Очистить историю\n/help - Справка\n/status - Статус бота',
+    'help': '''ℹ️ Справка:
+• Просто отправьте сообщение для чата
+• /clear - очистить историю разговора
+• /history - показать историю
+• /status - информация о боте
+• Отправляйте фото и документы для обработки
+''',
+    'cleared': '✅ История разговора очищена',
+    'processing': '⏳ Обрабатываю ваш запрос...',
+    'error': '❌ Ошибка: {error}',
+    'no_history': '📭 История пуста',
+    'history_header': '📋 История разговора:\n\n',
+    'status': '''📊 Статус бота:
+Версия: 1.0
+Фреймворк: aiogram 3.x
+Модель: g4f (ChatGPT)
+Язык: Русский
+Статус: ✅ Онлайн''',
+    'file_saved': '💾 Файл сохранён: {filename}',
+    'file_error': '❌ Ошибка при сохранении файла: {error}',
+    'typing': '✍️ {name} печатает...',
 }
 
 
-class ConversationManager:
-    """Manages conversation history persistence"""
+# FSM States
+class BotStates(StatesGroup):
+    waiting_for_message = State()
+    processing = State()
 
-    def __init__(self, user_id: int, language: str = 'en'):
+
+class ConversationHistory:
+    """Manager for conversation history persistence"""
+    
+    def __init__(self, user_id: int):
         self.user_id = user_id
-        self.language = language
-        self.history_file = CONVERSATION_DIR / f"user_{user_id}.json"
-        self.conversation: List[Dict[str, str]] = []
+        self.history_file = HISTORY_DIR / f'{user_id}.json'
+        self.messages: List[Dict] = []
         self._load_history()
-
-    def _ensure_dir(self):
-        """Ensure conversation directory exists"""
-        CONVERSATION_DIR.mkdir(exist_ok=True)
-
+    
     def _load_history(self):
         """Load conversation history from file"""
-        self._ensure_dir()
-        if self.history_file.exists():
-            try:
+        try:
+            if self.history_file.exists():
                 with open(self.history_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                    self.conversation = data.get('conversation', [])
-                    self.language = data.get('language', 'en')
-            except Exception as e:
-                logger.error(f"Error loading history: {e}")
-                self.conversation = []
-
-    def save_history(self):
-        """Save conversation history to file"""
-        self._ensure_dir()
-        try:
-            with open(self.history_file, 'w', encoding='utf-8') as f:
-                json.dump({
-                    'user_id': self.user_id,
-                    'language': self.language,
-                    'conversation': self.conversation,
-                    'timestamp': datetime.now().isoformat()
-                }, f, ensure_ascii=False, indent=2)
+                    self.messages = data.get('messages', [])
+                logger.info(f'Loaded {len(self.messages)} messages for user {self.user_id}')
         except Exception as e:
-            logger.error(f"Error saving history: {e}")
-
+            logger.error(f'Error loading history: {e}')
+            self.messages = []
+    
+    async def _save_history(self):
+        """Save conversation history to file"""
+        try:
+            async with aiofiles.open(self.history_file, 'w', encoding='utf-8') as f:
+                data = {
+                    'user_id': self.user_id,
+                    'messages': self.messages,
+                    'last_update': datetime.now().isoformat()
+                }
+                await f.write(json.dumps(data, indent=2, ensure_ascii=False))
+        except Exception as e:
+            logger.error(f'Error saving history: {e}')
+    
     def add_message(self, role: str, content: str):
-        """Add a message to conversation history"""
-        self.conversation.append({
+        """Add message to history"""
+        self.messages.append({
             'role': role,
             'content': content,
             'timestamp': datetime.now().isoformat()
         })
-
-        # Keep history within limit
-        if len(self.conversation) > MAX_HISTORY_LENGTH:
-            self.conversation = self.conversation[-MAX_HISTORY_LENGTH:]
-
-        self.save_history()
-
-    def get_history(self, limit: int = None) -> List[Dict[str, str]]:
-        """Get conversation history"""
-        if limit:
-            return self.conversation[-limit:]
-        return self.conversation
-
-    def clear_history(self):
+        # Keep only last MAX_HISTORY_MESSAGES
+        if len(self.messages) > MAX_HISTORY_MESSAGES:
+            self.messages = self.messages[-MAX_HISTORY_MESSAGES:]
+    
+    async def save(self):
+        """Save history asynchronously"""
+        await self._save_history()
+    
+    def clear(self):
         """Clear conversation history"""
-        self.conversation = []
-        self.save_history()
+        self.messages = []
+    
+    def get_context(self) -> List[Dict]:
+        """Get conversation context for AI"""
+        return [{'role': msg['role'], 'content': msg['content']} 
+                for msg in self.messages]
+    
+    def get_display(self) -> str:
+        """Get formatted history for display"""
+        if not self.messages:
+            return TEXTS['no_history']
+        
+        display = TEXTS['history_header']
+        for msg in self.messages[-10:]:  # Show last 10 messages
+            role = '👤 Вы' if msg['role'] == 'user' else '🤖 Бот'
+            content = msg['content'][:100] + '...' if len(msg['content']) > 100 else msg['content']
+            display += f'{role}: {content}\n'
+        return display
 
-    def set_language(self, language: str):
-        """Set user language"""
-        if language in TRANSLATIONS:
-            self.language = language
-            self.save_history()
-            return True
-        return False
 
-
-class G4FBot:
-    """Main bot class using g4f integration"""
-
-    def __init__(self, bot_token: str):
-        self.application = Application.builder().token(bot_token).build()
-        self.setup_handlers()
-        self.conversation_managers: Dict[int, ConversationManager] = {}
-
-    def get_manager(self, user_id: int) -> ConversationManager:
-        """Get or create conversation manager for user"""
-        if user_id not in self.conversation_managers:
-            self.conversation_managers[user_id] = ConversationManager(user_id)
-        return self.conversation_managers[user_id]
-
-    def get_translation(self, user_id: int, key: str) -> str:
-        """Get translation for user's language"""
-        manager = self.get_manager(user_id)
-        lang = manager.language
-        return TRANSLATIONS.get(lang, TRANSLATIONS['en']).get(key, TRANSLATIONS['en'].get(key, ''))
-
-    def setup_handlers(self):
-        """Setup command and message handlers"""
-        self.application.add_handler(CommandHandler("start", self.start))
-        self.application.add_handler(CommandHandler("help", self.help_command))
-        self.application.add_handler(CommandHandler("clear", self.clear_history))
-        self.application.add_handler(CommandHandler("history", self.show_history))
-        self.application.add_handler(CommandHandler("language", self.language_command))
-        self.application.add_handler(CommandHandler("file", self.file_command))
-
-        self.application.add_handler(
-            MessageHandler(filters.Document.ALL, self.handle_file)
-        )
-        self.application.add_handler(
-            MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message)
-        )
-
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Start command handler"""
-        user_id = update.effective_user.id
-        manager = self.get_manager(user_id)
-        welcome_msg = self.get_translation(user_id, 'welcome')
-
-        await update.message.reply_text(welcome_msg)
-        logger.info(f"User {user_id} started the bot")
-
-    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Help command handler"""
-        user_id = update.effective_user.id
-        help_msg = self.get_translation(user_id, 'help')
-        await update.message.reply_text(help_msg)
-
-    async def clear_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Clear conversation history"""
-        user_id = update.effective_user.id
-        manager = self.get_manager(user_id)
-        manager.clear_history()
-
-        cleared_msg = self.get_translation(user_id, 'cleared')
-        await update.message.reply_text(cleared_msg)
-        logger.info(f"User {user_id} cleared conversation history")
-
-    async def show_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show conversation history"""
-        user_id = update.effective_user.id
-        manager = self.get_manager(user_id)
-        history = manager.get_history()
-
-        if not history:
-            empty_msg = self.get_translation(user_id, 'history_empty')
-            await update.message.reply_text(empty_msg)
-            return
-
-        history_text = "📋 Conversation History:\n\n"
-        for i, msg in enumerate(history[-10:], 1):  # Show last 10 messages
-            role = "👤" if msg['role'] == 'user' else "🤖"
-            timestamp = msg.get('timestamp', '')[:16]
-            history_text += f"{i}. {role} [{timestamp}]\n{msg['content']}\n\n"
-
-        await update.message.reply_text(history_text, parse_mode=None)
-
-    async def language_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle language switching"""
-        user_id = update.effective_user.id
-        manager = self.get_manager(user_id)
-
-        if context.args and context.args[0] in ['en', 'ru']:
-            language = context.args[0]
-            if manager.set_language(language):
-                lang_msg = self.get_translation(user_id, 'language_switched')
-                await update.message.reply_text(lang_msg)
-                logger.info(f"User {user_id} switched to {language}")
-        else:
-            await update.message.reply_text("Use /language en or /language ru")
-
-    async def file_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Inform user how to send files"""
-        user_id = update.effective_user.id
-        msg = self.get_translation(user_id, 'no_file')
-        await update.message.reply_text(msg)
-
-    async def handle_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle file uploads and analysis"""
-        user_id = update.effective_user.id
-        manager = self.get_manager(user_id)
-        document = update.message.document
-
-        # Check file type
-        file_ext = Path(document.file_name).suffix.lower()
-        if file_ext not in SUPPORTED_FILE_TYPES:
-            error_msg = self.get_translation(user_id, 'unsupported_file')
-            supported = ', '.join(SUPPORTED_FILE_TYPES)
-            await update.message.reply_text(error_msg.format(supported))
-            return
-
-        try:
-            # Download and read file
-            file = await context.bot.get_file(document.file_id)
-            file_path = f"temp_{user_id}_{document.file_name}"
-
-            await file.download_to_drive(file_path)
-
-            with open(file_path, 'r', encoding='utf-8') as f:
-                file_content = f.read()
-
-            # Clean up temp file
-            os.remove(file_path)
-
-            # Create analysis prompt
-            received_msg = self.get_translation(user_id, 'file_received')
-            await update.message.reply_text(received_msg.format(document.file_name))
-
-            analysis_prompt = (
-                f"Please analyze the following file content ({document.file_name}):\n\n"
-                f"{file_content[:2000]}"  # Limit content length
-            )
-
-            # Get AI response
-            response = await self.get_ai_response(analysis_prompt, manager)
-            manager.add_message('user', f'[File Analysis] {document.file_name}')
-            manager.add_message('assistant', response)
-
-            await update.message.reply_text(response)
-
-        except Exception as e:
-            error_msg = self.get_translation(user_id, 'file_error')
-            await update.message.reply_text(error_msg.format(str(e)))
-            logger.error(f"Error handling file: {e}")
-
-    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle regular messages"""
-        user_id = update.effective_user.id
-        manager = self.get_manager(user_id)
-        user_message = update.message.text
-
-        # Show typing indicator
-        await update.message.chat.send_action(ChatAction.TYPING)
-
-        # Add user message to history
-        manager.add_message('user', user_message)
-
-        try:
-            # Get AI response
-            response = await self.get_ai_response(user_message, manager)
-
-            # Add assistant message to history
-            manager.add_message('assistant', response)
-
-            # Send response
-            await update.message.reply_text(response)
-
-        except Exception as e:
-            logger.error(f"Error processing message: {e}")
-            error_msg = self.get_translation(user_id, 'error')
-            await update.message.reply_text(error_msg)
-
-    async def get_ai_response(self, user_input: str, manager: ConversationManager) -> str:
-        """Get response from g4f"""
-        try:
-            # Prepare conversation history for g4f
-            messages = [
-                {"role": msg['role'], "content": msg['content']}
-                for msg in manager.get_history()[-10:]  # Use last 10 messages for context
-            ]
-
-            # Add current user message if not already in history
-            if not messages or messages[-1]['content'] != user_input:
-                messages.append({"role": "user", "content": user_input})
-
-            # Get response from g4f
-            response = await asyncio.to_thread(
-                self._call_g4f,
-                messages,
-                manager.language
-            )
-
-            return response if response else self.get_translation(
-                manager.user_id, 'error'
-            )
-
-        except Exception as e:
-            logger.error(f"Error getting AI response: {e}")
-            raise
-
+class FileHandler:
+    """Handle file uploads and processing"""
+    
     @staticmethod
-    def _call_g4f(messages: List[Dict[str, str]], language: str) -> str:
-        """Call g4f API synchronously"""
+    async def save_file(bot: Bot, file_id: str, file_name: str) -> Optional[str]:
+        """Download and save file from Telegram"""
         try:
-            # Add system prompt with language preference
-            system_prompt = (
-                f"You are a helpful assistant. Respond in {language} language. "
-                "Be concise and helpful."
-            )
-
-            full_messages = [
-                {"role": "system", "content": system_prompt},
-                *messages
-            ]
-
-            # Try to get response from g4f
-            response = g4f.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=full_messages,
-            )
-
-            if isinstance(response, str):
-                return response
-            else:
-                # Handle generator/iterator response
-                return "".join(response) if response else "No response"
-
+            file = await bot.get_file(file_id)
+            file_path = UPLOADS_DIR / file_name
+            
+            await bot.download_file(file.file_path, str(file_path))
+            logger.info(f'File saved: {file_path}')
+            return str(file_path)
         except Exception as e:
-            logger.error(f"g4f error: {e}")
-            raise
-
-    def run(self):
-        """Run the bot"""
-        logger.info("Starting Telegram ChatGPT Bot with g4f...")
-        self.application.run_polling()
-
-
-def main():
-    """Main entry point"""
-    if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        logger.error("Please set TELEGRAM_BOT_TOKEN environment variable")
-        return
-
-    bot = G4FBot(BOT_TOKEN)
-    bot.run()
+            logger.error(f'Error saving file: {e}')
+            return None
+    
+    @staticmethod
+    def get_file_description(file_path: str) -> str:
+        """Get description of file content"""
+        try:
+            path = Path(file_path)
+            size = path.stat().st_size
+            size_mb = size / (1024 * 1024)
+            return f'Файл: {path.name} ({size_mb:.2f} MB)'
+        except Exception as e:
+            return f'Ошибка при чтении файла: {e}'
 
 
-if __name__ == "__main__":
-    main()
+class ChatGPTClient:
+    """Client for interacting with ChatGPT via g4f"""
+    
+    def __init__(self):
+        self.provider = None
+        self._init_provider()
+    
+    def _init_provider(self):
+        """Initialize g4f provider"""
+        if g4f is None:
+            logger.warning('g4f is not installed. Install it with: pip install g4f')
+            return
+        
+        try:
+            self.provider = g4f.Provider.Bing
+            logger.info(f'Initialized provider: {self.provider}')
+        except Exception as e:
+            logger.error(f'Error initializing provider: {e}')
+    
+    async def get_response(self, messages: List[Dict], user_name: str = 'Пользователь') -> Optional[str]:
+        """Get response from ChatGPT"""
+        if self.provider is None:
+            return '⚠️ g4f не настроен. Установите: pip install g4f'
+        
+        try:
+            logger.info(f'Requesting response for {len(messages)} messages')
+            
+            # Run g4f in thread pool to avoid blocking
+            response = await asyncio.to_thread(
+                self._make_request,
+                messages
+            )
+            return response
+        except Exception as e:
+            logger.error(f'Error getting response: {e}')
+            return TEXTS['error'].format(error=str(e)[:100])
+    
+    def _make_request(self, messages: List[Dict]) -> str:
+        """Make synchronous request to g4f"""
+        try:
+            response = g4f.ChatCompletion.create(
+                model=g4f.models.gpt_4,
+                messages=messages,
+                stream=False,
+            )
+            return str(response) if response else '❌ Пустой ответ от модели'
+        except Exception as e:
+            raise e
+
+
+# Global objects
+bot = Bot(token=TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+chatgpt = ChatGPTClient()
+conversations: Dict[int, ConversationHistory] = {}
+
+
+def get_conversation(user_id: int) -> ConversationHistory:
+    """Get or create conversation history for user"""
+    if user_id not in conversations:
+        conversations[user_id] = ConversationHistory(user_id)
+    return conversations[user_id]
+
+
+# Handlers
+@dp.message(Command('start'))
+async def cmd_start(message: Message, state: FSMContext):
+    """Start command handler"""
+    logger.info(f'User {message.from_user.id} started the bot')
+    await message.answer(TEXTS['welcome'])
+    await state.set_state(BotStates.waiting_for_message)
+
+
+@dp.message(Command('help'))
+async def cmd_help(message: Message):
+    """Help command handler"""
+    await message.answer(TEXTS['help'])
+
+
+@dp.message(Command('clear'))
+async def cmd_clear(message: Message):
+    """Clear conversation history"""
+    conv = get_conversation(message.from_user.id)
+    conv.clear()
+    await conv.save()
+    await message.answer(TEXTS['cleared'])
+
+
+@dp.message(Command('history'))
+async def cmd_history(message: Message):
+    """Show conversation history"""
+    conv = get_conversation(message.from_user.id)
+    history_text = conv.get_display()
+    
+    # Split long messages
+    if len(history_text) > 4096:
+        parts = [history_text[i:i+4096] for i in range(0, len(history_text), 4096)]
+        for part in parts:
+            await message.answer(part)
+    else:
+        await message.answer(history_text)
+
+
+@dp.message(Command('status'))
+async def cmd_status(message: Message):
+    """Show bot status"""
+    await message.answer(TEXTS['status'])
+
+
+@dp.message(F.photo)
+async def handle_photo(message: Message):
+    """Handle photo uploads"""
+    try:
+        photo = message.photo[-1]  # Get highest quality
+        file_info = await bot.get_file(photo.file_id)
+        
+        filename = f'photo_{message.from_user.id}_{datetime.now().timestamp()}.jpg'
+        file_path = await FileHandler.save_file(bot, photo.file_id, filename)
+        
+        if file_path:
+            conv = get_conversation(message.from_user.id)
+            description = FileHandler.get_file_description(file_path)
+            conv.add_message('user', f'📷 {description}')
+            
+            await message.answer(TEXTS['file_saved'].format(filename=filename))
+            await message.answer(f'✅ {description}')
+            await conv.save()
+        else:
+            await message.answer(TEXTS['file_error'].format(error='Не удалось загрузить'))
+    except Exception as e:
+        logger.error(f'Error handling photo: {e}')
+        await message.answer(TEXTS['file_error'].format(error=str(e)[:50]))
+
+
+@dp.message(F.document)
+async def handle_document(message: Message):
+    """Handle document uploads"""
+    try:
+        document = message.document
+        filename = f'{message.from_user.id}_{datetime.now().timestamp()}_{document.file_name}'
+        
+        file_path = await FileHandler.save_file(bot, document.file_id, filename)
+        
+        if file_path:
+            conv = get_conversation(message.from_user.id)
+            description = FileHandler.get_file_description(file_path)
+            conv.add_message('user', f'📄 {description}')
+            
+            await message.answer(TEXTS['file_saved'].format(filename=document.file_name))
+            await conv.save()
+        else:
+            await message.answer(TEXTS['file_error'].format(error='Не удалось загрузить'))
+    except Exception as e:
+        logger.error(f'Error handling document: {e}')
+        await message.answer(TEXTS['file_error'].format(error=str(e)[:50]))
+
+
+@dp.message(StateFilter(None) | BotStates.waiting_for_message)
+async def handle_message(message: Message, state: FSMContext):
+    """Main message handler for chat"""
+    try:
+        user_id = message.from_user.id
+        user_name = message.from_user.first_name or 'Пользователь'
+        
+        # Show typing indicator
+        async with bot.context_manager.get_chat_member(message.chat.id, user_id):
+            await message.chat.send_action('typing')
+        
+        # Show processing message
+        status_msg = await message.answer(TEXTS['processing'])
+        
+        # Get conversation history
+        conv = get_conversation(user_id)
+        
+        # Add user message to history
+        conv.add_message('user', message.text)
+        
+        # Get conversation context
+        context = conv.get_context()
+        
+        logger.info(f'User {user_id} ({user_name}): {message.text}')
+        
+        # Get response from ChatGPT
+        await state.set_state(BotStates.processing)
+        response = await chatgpt.get_response(context, user_name)
+        
+        # Add assistant response to history
+        if response and response.startswith('❌') is False:
+            conv.add_message('assistant', response)
+        
+        # Save conversation history
+        await conv.save()
+        
+        # Send response
+        if response:
+            if len(response) > 4096:
+                # Split long messages
+                parts = [response[i:i+4096] for i in range(0, len(response), 4096)]
+                await status_msg.delete()
+                for part in parts:
+                    await message.answer(part)
+            else:
+                await status_msg.edit_text(response)
+        else:
+            await status_msg.edit_text('❌ Не удалось получить ответ')
+        
+        await state.set_state(BotStates.waiting_for_message)
+        
+    except Exception as e:
+        logger.error(f'Error in message handler: {e}')
+        await message.answer(TEXTS['error'].format(error=str(e)[:100]))
+        await state.set_state(BotStates.waiting_for_message)
+
+
+async def main():
+    """Main function to start the bot"""
+    logger.info('Starting Telegram ChatGPT Bot...')
+    logger.info(f'Bot Token: {TOKEN[:10]}...')
+    logger.info(f'g4f available: {g4f is not None}')
+    
+    try:
+        # Start polling
+        await dp.start_polling(
+            bot,
+            allowed_updates=dp.resolve_used_update_types()
+        )
+    except Exception as e:
+        logger.error(f'Error in main: {e}')
+    finally:
+        await bot.session.close()
+
+
+if __name__ == '__main__':
+    asyncio.run(main())
